@@ -210,49 +210,70 @@ IncrementalPipeline::IncrementalPipeline(
   RegisterCallback(LAST_IMAGE_REG_CALLBACK);
 }
 
+/**
+ * [功能描述]：增量式重建管道的主运行函数，执行完整的Structure-from-Motion重建流程
+ * @return [返回值说明]：无返回值，通过异常或日志输出处理错误
+ */
 void IncrementalPipeline::Run() {
+  // 创建计时器，用于记录整个重建过程的耗时
   Timer run_timer;
   run_timer.Start();
+  
+  // 加载数据库，如果加载失败则直接返回
   if (!LoadDatabase()) {
     return;
   }
 
-  // Is there a sub-reconstruction before we start the reconstruction? I.e. the
-  // user has imported an existing reconstruction.
+  // 检查是否在开始重建前已有子重建，即用户是否导入了现有的重建
   const bool continue_reconstruction = reconstruction_manager_->Size() > 0;
+  // 确保只能从一个单一的重建继续，不能从多个重建继续
   THROW_CHECK_LE(reconstruction_manager_->Size(), 1)
       << "Can only continue from a single reconstruction, "
          "but multiple are given.";
 
+  // 获取数据库中图像的总数量
   const size_t num_images = database_cache_->NumImages();
 
+  // 创建增量式映射器并配置其选项
   IncrementalMapper::Options mapper_options = options_->Mapper();
   IncrementalMapper mapper(database_cache_);
+  
+  // 执行主要的重建过程
   Reconstruct(mapper,
               mapper_options,
               /*continue_reconstruction=*/continue_reconstruction);
 
+  // 定义初始化约束松弛的次数
   const size_t kNumInitRelaxations = 2;
+  
+  // 进行多次初始化约束松弛，以提高图像注册的成功率
   for (size_t i = 0; i < kNumInitRelaxations; ++i) {
+    // 如果所有图像都已注册或用户请求停止，则跳出循环
     if (mapper.NumTotalRegImages() == num_images || CheckIfStopped()) {
       break;
     }
 
+    // 第一次松弛：降低最小内点数量要求
     LOG(INFO) << "=> Relaxing the initialization constraints.";
-    mapper_options.init_min_num_inliers /= 2;
-    mapper.ResetInitializationStats();
+    mapper_options.init_min_num_inliers /= 2;  // 将最小内点数量减半
+    mapper.ResetInitializationStats();  // 重置初始化统计信息
+    // 重新执行重建，不继续现有重建
     Reconstruct(mapper, mapper_options, /*continue_reconstruction=*/false);
 
+    // 再次检查是否所有图像都已注册或用户请求停止
     if (mapper.NumTotalRegImages() == num_images || CheckIfStopped()) {
       break;
     }
 
+    // 第二次松弛：降低最小三角化角度要求
     LOG(INFO) << "=> Relaxing the initialization constraints.";
-    mapper_options.init_min_tri_angle /= 2;
-    mapper.ResetInitializationStats();
+    mapper_options.init_min_tri_angle /= 2;  // 将最小三角化角度减半
+    mapper.ResetInitializationStats();  // 重置初始化统计信息
+    // 再次重新执行重建
     Reconstruct(mapper, mapper_options, /*continue_reconstruction=*/false);
   }
 
+  // 打印整个重建过程的耗时（以分钟为单位）
   run_timer.PrintMinutes();
 }
 

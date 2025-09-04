@@ -183,114 +183,162 @@ int RunBundleAdjuster(int argc, char** argv) {
   return EXIT_SUCCESS;
 }
 
+/**
+ * [功能描述]：颜色提取器主函数，从重建模型中提取所有图像的颜色信息并保存到输出路径
+ * @param argc [参数说明]：命令行参数数量
+ * @param argv [参数说明]：命令行参数数组
+ * @return [返回值说明]：程序执行状态，EXIT_SUCCESS表示成功
+ */
 int RunColorExtractor(int argc, char** argv) {
-  std::string input_path;
-  std::string output_path;
+  // 定义输入和输出路径变量
+  std::string input_path;   // 输入重建模型路径
+  std::string output_path;  // 输出重建模型路径
 
+  // 创建选项管理器，用于解析命令行参数
   OptionManager options;
+  // 添加图像相关选项（如图像路径等）
   options.AddImageOptions();
+  // 添加默认选项：输入路径（可选参数）
   options.AddDefaultOption("input_path", &input_path);
+  // 添加必需选项：输出路径（必须提供的参数）
   options.AddRequiredOption("output_path", &output_path);
+  // 解析命令行参数，将参数值赋给对应的变量
   options.Parse(argc, argv);
 
+  // 创建重建对象，用于存储3D重建数据
   Reconstruction reconstruction;
+  // 从输入路径读取重建模型数据
   reconstruction.Read(input_path);
+  // 为所有图像提取颜色信息
+  // *options.image_path 指向图像文件夹路径，用于访问原始图像文件
   reconstruction.ExtractColorsForAllImages(*options.image_path);
+  // 将包含颜色信息的重建模型写入输出路径
   reconstruction.Write(output_path);
 
+  // 返回成功状态
   return EXIT_SUCCESS;
 }
 
+/**
+ * [功能描述]：映射器主函数，执行增量式Structure-from-Motion重建，从图像特征创建稀疏3D模型
+ * @param argc [参数说明]：命令行参数数量
+ * @param argv [参数说明]：命令行参数数组
+ * @return [返回值说明]：程序执行状态，EXIT_SUCCESS表示成功，EXIT_FAILURE表示失败
+ */
 int RunMapper(int argc, char** argv) {
-  std::string input_path;
-  std::string output_path;
+  // 定义输入和输出路径变量
+  std::string input_path;   // 输入重建路径（可选，用于继续现有重建）
+  std::string output_path;  // 输出重建路径（必需）
 
+  // 创建选项管理器，用于解析命令行参数
   OptionManager options;
+  // 添加数据库相关选项（如数据库路径等）
   options.AddDatabaseOptions();
+  // 添加图像相关选项（如图像路径等）
   options.AddImageOptions();
+  // 添加输入路径选项（可选参数）
   options.AddDefaultOption("input_path", &input_path);
+  // 添加输出路径选项（必需参数）
   options.AddRequiredOption("output_path", &output_path);
+  // 添加映射器相关选项（如重建参数等）
   options.AddMapperOptions();
+  // 解析命令行参数，将参数值赋给对应的变量
   options.Parse(argc, argv);
 
+  // 验证输出路径是否为有效目录
   if (!ExistsDir(output_path)) {
     LOG(ERROR) << "`output_path` is not a directory.";
     return EXIT_FAILURE;
   }
 
+  // 创建重建管理器，用于管理多个重建模型
   auto reconstruction_manager = std::make_shared<ReconstructionManager>();
+  // 如果提供了输入路径，则加载现有的重建数据
   if (input_path != "") {
+    // 验证输入路径是否为有效目录
     if (!ExistsDir(input_path)) {
       LOG(ERROR) << "`input_path` is not a directory.";
       return EXIT_FAILURE;
     }
+    // 从输入路径读取现有的重建数据
     reconstruction_manager->Read(input_path);
   }
 
-  // If fix_existing_frames is enabled, we store the initial positions of
-  // existing images in order to transform them back to the original coordinate
-  // frame, as the reconstruction is normalized multiple times for numerical
-  // stability.
-  std::vector<Eigen::Vector3d> orig_fixed_image_positions;
-  std::vector<image_t> fixed_image_ids;
+  // 如果启用了fix_existing_frames选项，存储现有图像的初始位置
+  // 这是因为重建过程中会多次进行归一化以确保数值稳定性，
+  // 需要将结果转换回原始坐标系
+  std::vector<Eigen::Vector3d> orig_fixed_image_positions;  // 原始固定图像位置
+  std::vector<image_t> fixed_image_ids;  // 固定图像ID列表
   if (options.mapper->fix_existing_frames &&
       reconstruction_manager->Size() > 0) {
+    // 提取现有图像的信息，用于后续坐标系转换
     std::tie(fixed_image_ids, orig_fixed_image_positions) =
         ExtractExistingImages(*reconstruction_manager->Get(0));
   }
 
+  // 创建增量式重建管道，配置映射器、图像路径、数据库路径和重建管理器
   IncrementalPipeline mapper(options.mapper,
                              *options.image_path,
                              *options.database_path,
                              reconstruction_manager);
 
-  // In case a new reconstruction is started, write results of individual sub-
-  // models to as their reconstruction finishes instead of writing all results
-  // after all reconstructions finished.
-  size_t prev_num_reconstructions = 0;
+  // 如果是新开始的重建，为每个子模型单独写入结果
+  // 而不是等所有重建完成后一次性写入所有结果
+  size_t prev_num_reconstructions = 0;  // 前一次重建数量
   if (input_path == "") {
+    // 添加回调函数，在每张图像注册完成后执行
     mapper.AddCallback(IncrementalPipeline::LAST_IMAGE_REG_CALLBACK, [&]() {
-      // If the number of reconstructions has not changed, the last model
-      // was discarded for some reason.
+      // 如果重建数量没有变化，说明最后一个模型被丢弃了
       if (reconstruction_manager->Size() > prev_num_reconstructions) {
+        // 构建重建路径：输出路径 + 重建编号
         const std::string reconstruction_path =
             JoinPaths(output_path, std::to_string(prev_num_reconstructions));
+        // 创建重建目录（如果不存在）
         CreateDirIfNotExists(reconstruction_path);
+        // 写入当前重建模型
         reconstruction_manager->Get(prev_num_reconstructions)
             ->Write(reconstruction_path);
+        // 写入项目配置文件
         options.Write(JoinPaths(reconstruction_path, "project.ini"));
+        // 更新前一次重建数量
         prev_num_reconstructions = reconstruction_manager->Size();
       }
     });
   }
 
+  // 运行映射器，执行增量式重建
   mapper.Run();
 
+  // 检查是否成功创建了稀疏模型
   if (reconstruction_manager->Size() == 0) {
     LOG(ERROR) << "failed to create sparse model";
     return EXIT_FAILURE;
   }
 
-  // In case the reconstruction is continued from an existing reconstruction, do
-  // not create sub-folders but directly write the results.
+  // 如果是继续现有重建，不创建子文件夹，直接写入结果
   if (input_path != "") {
+    // 获取重建结果
     const auto& reconstruction = reconstruction_manager->Get(0);
 
-    // Transform the final reconstruction back to the original coordinate frame.
+    // 将最终重建结果转换回原始坐标系
     if (options.mapper->fix_existing_frames) {
+      // 检查是否有足够的固定图像进行变换
       if (fixed_image_ids.size() < 3) {
         LOG(WARNING) << "Too few images to transform the reconstruction.";
       } else {
+        // 收集当前固定图像的新位置
         std::vector<Eigen::Vector3d> new_fixed_image_positions;
         new_fixed_image_positions.reserve(fixed_image_ids.size());
         for (const image_t image_id : fixed_image_ids) {
           new_fixed_image_positions.push_back(
               reconstruction->Image(image_id).ProjectionCenter());
         }
+        // 估计从新坐标系到原始坐标系的相似变换
         Sim3d orig_from_new;
         if (EstimateSim3d(new_fixed_image_positions,
                           orig_fixed_image_positions,
                           orig_from_new)) {
+          // 应用变换，将重建结果转换回原始坐标系
           reconstruction->Transform(orig_from_new);
         } else {
           LOG(WARNING) << "Failed to transform the reconstruction back "
@@ -299,9 +347,11 @@ int RunMapper(int argc, char** argv) {
       }
     }
 
+    // 将重建结果写入输出路径
     reconstruction->Write(output_path);
   }
 
+  // 返回成功状态
   return EXIT_SUCCESS;
 }
 

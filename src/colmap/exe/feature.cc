@@ -88,66 +88,97 @@ void UpdateImageReaderOptionsFromCameraMode(ImageReaderOptions& options,
   }
 }
 
+/**
+ * [功能描述]：特征提取器主函数，从图像中提取SIFT特征点和描述符并存储到数据库中
+ * @param argc [参数说明]：命令行参数数量
+ * @param argv [参数说明]：命令行参数数组
+ * @return [返回值说明]：程序执行状态，EXIT_SUCCESS表示成功，EXIT_FAILURE表示失败
+ */
 int RunFeatureExtractor(int argc, char** argv) {
-  std::string image_list_path;
-  int camera_mode = -1;
-  std::string descriptor_normalization = "l1_root";
+  // 定义局部变量
+  std::string image_list_path;  // 图像列表文件路径（可选）
+  int camera_mode = -1;  // 相机模式：-1表示自动，0=自动，1=单一相机，2=每文件夹一个相机，3=每图像一个相机
+  std::string descriptor_normalization = "l1_root";  // 描述符归一化方式，默认为L1根归一化
 
+  // 创建选项管理器，用于解析命令行参数
   OptionManager options;
+  // 添加数据库相关选项（如数据库路径等）
   options.AddDatabaseOptions();
+  // 添加图像相关选项（如图像路径、相机参数等）
   options.AddImageOptions();
+  // 添加相机模式选项（可选参数）
   options.AddDefaultOption("camera_mode", &camera_mode);
+  // 添加图像列表路径选项（可选参数）
   options.AddDefaultOption("image_list_path", &image_list_path);
+  // 添加描述符归一化选项，支持'l1_root'和'l2'两种方式
   options.AddDefaultOption("descriptor_normalization",
                            &descriptor_normalization,
                            "{'l1_root', 'l2'}");
+  // 添加特征提取相关选项（如SIFT参数、GPU使用等）
   options.AddFeatureExtractionOptions();
+  // 解析命令行参数，将参数值赋给对应的变量
   options.Parse(argc, argv);
 
-  ImageReaderOptions reader_options = *options.image_reader;
-  reader_options.image_path = *options.image_path;
-  reader_options.as_rgb = options.feature_extraction->RequiresRGB();
+  // 配置图像读取器选项
+  ImageReaderOptions reader_options = *options.image_reader;  // 复制图像读取器选项
+  reader_options.image_path = *options.image_path;  // 设置图像路径
+  reader_options.as_rgb = options.feature_extraction->RequiresRGB();  // 根据特征提取器要求设置RGB模式
 
+  // 如果指定了相机模式，则更新图像读取器选项
   if (camera_mode >= 0) {
+    // 根据相机模式更新图像读取器选项
     UpdateImageReaderOptionsFromCameraMode(reader_options,
                                            (CameraMode)camera_mode);
   }
 
+  // 将描述符归一化方式转换为大写
   StringToUpper(&descriptor_normalization);
+  // 设置SIFT特征提取器的归一化方式
   options.feature_extraction->sift->normalization =
       SiftExtractionOptions::NormalizationFromString(descriptor_normalization);
 
+  // 如果提供了图像列表文件路径，则读取图像列表
   if (!image_list_path.empty()) {
+    // 从文件中读取图像名称列表
     reader_options.image_names = ReadTextFileLines(image_list_path);
+    // 如果图像列表为空，直接返回成功（没有图像需要处理）
     if (reader_options.image_names.empty()) {
       return EXIT_SUCCESS;
     }
   }
 
+  // 验证相机模型是否存在
   if (!ExistsCameraModelWithName(reader_options.camera_model)) {
     LOG(ERROR) << "Camera model does not exist";
   }
 
+  // 验证相机参数是否有效
   if (!VerifyCameraParams(reader_options.camera_model,
                           reader_options.camera_params)) {
-    return EXIT_FAILURE;
+    return EXIT_FAILURE;  // 相机参数无效，返回失败
   }
 
+  // 如果使用GPU且支持OpenGL，则创建Qt应用程序（用于OpenGL上下文）
   std::unique_ptr<QApplication> app;
   if (options.feature_extraction->use_gpu && kUseOpenGL) {
     app.reset(new QApplication(argc, argv));
   }
 
+  // 创建特征提取控制器
   auto feature_extractor = CreateFeatureExtractorController(
       *options.database_path, reader_options, *options.feature_extraction);
 
+  // 根据是否使用GPU选择不同的执行方式
   if (options.feature_extraction->use_gpu && kUseOpenGL) {
+    // 使用GPU：在OpenGL上下文中运行特征提取线程
     RunThreadWithOpenGLContext(feature_extractor.get());
   } else {
+    // 使用CPU：直接启动特征提取并等待完成
     feature_extractor->Start();
     feature_extractor->Wait();
   }
 
+  // 返回成功状态
   return EXIT_SUCCESS;
 }
 
