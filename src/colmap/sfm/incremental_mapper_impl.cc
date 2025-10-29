@@ -228,6 +228,22 @@ std::vector<image_t> IncrementalMapperImpl::FindSecondInitialImage(
   return image_ids;
 }
 
+/**
+ * [功能描述]：为增量式重建查找合适的初始图像对。
+ *             该函数是SfM初始化的核心，负责选择一对具有良好几何关系的图像作为重建起点。
+ *             它支持三种模式：用户指定第一张图像、用户指定第二张图像、或完全自动选择。
+ * 
+ * @param options：映射器配置选项，包含初始化相关的阈值和参数。
+ * @param database_cache：数据库缓存，包含图像、特征匹配等所有重建所需数据。
+ * @param reconstruction：当前重建实例，用于检查哪些图像已被注册。
+ * @param init_num_reg_trials：记录每张图像作为初始图像尝试注册的次数。
+ * @param num_registrations：记录每张图像在所有重建中被注册的总次数。
+ * @param init_image_pairs：已尝试过的初始图像对集合（避免重复尝试）。
+ * @param image_id1：输入/输出参数，第一张图像的ID（可预先指定或由函数返回）。
+ * @param image_id2：输入/输出参数，第二张图像的ID（可预先指定或由函数返回）。
+ * @param cam2_from_cam1：输出参数，从相机1到相机2的刚体变换（旋转+平移）。
+ * @return 如果找到合适的初始图像对返回true，否则返回false。
+ */
 bool IncrementalMapperImpl::FindInitialImagePair(
     const IncrementalMapper::Options& options,
     const DatabaseCache& database_cache,
@@ -238,23 +254,31 @@ bool IncrementalMapperImpl::FindInitialImagePair(
     image_t& image_id1,
     image_t& image_id2,
     Rigid3d& cam2_from_cam1) {
+  // 验证配置选项的有效性
   THROW_CHECK(options.Check());
 
+  // 候选的第一张图像列表
   std::vector<image_t> image_ids1;
+  
+  // 根据输入参数确定第一张图像的候选列表
   if (image_id1 != kInvalidImageId && image_id2 == kInvalidImageId) {
-    // Only image_id1 provided.
+    // 情况1：仅提供了第一张图像ID
+    // 验证该图像是否存在于数据库中
     if (!database_cache.ExistsImage(image_id1)) {
       return false;
     }
+    // 使用用户指定的第一张图像
     image_ids1.push_back(image_id1);
   } else if (image_id1 == kInvalidImageId && image_id2 != kInvalidImageId) {
-    // Only image_id2 provided.
+    // 情况2：仅提供了第二张图像ID
+    // 将第二张图像作为第一张图像使用
     if (!database_cache.ExistsImage(image_id2)) {
       return false;
     }
     image_ids1.push_back(image_id2);
   } else {
-    // No initial seed image provided.
+    // 情况3：没有提供任何种子图像，需要自动选择
+    // 根据特征匹配数量、分布等指标自动选择最佳的第一张图像候选列表
     image_ids1 = IncrementalMapperImpl::FindFirstInitialImage(
         options,
         *database_cache.CorrespondenceGraph(),
@@ -263,10 +287,12 @@ bool IncrementalMapperImpl::FindInitialImagePair(
         num_registrations);
   }
 
-  // Try to find good initial pair.
+  // 尝试为每个候选的第一张图像找到合适的第二张图像，构成初始图像对
   for (size_t i1 = 0; i1 < image_ids1.size(); ++i1) {
     image_id1 = image_ids1[i1];
 
+    // 为当前第一张图像查找候选的第二张图像列表
+    // 选择标准：与第一张图像有足够的特征匹配、观测重叠适中等
     const std::vector<image_t> image_ids2 =
         IncrementalMapperImpl::FindSecondInitialImage(
             options,
@@ -275,16 +301,22 @@ bool IncrementalMapperImpl::FindInitialImagePair(
             reconstruction,
             num_registrations);
 
+    // 遍历所有候选的第二张图像
     for (size_t i2 = 0; i2 < image_ids2.size(); ++i2) {
       image_id2 = image_ids2[i2];
 
+      // 计算图像对的唯一标识符
       const image_pair_t pair_id = ImagePairToPairId(image_id1, image_id2);
 
-      // Try every pair only once.
+      // 确保每个图像对只尝试一次
+      // emplace返回pair<iterator, bool>，second为false表示该pair_id已存在
       if (!init_image_pairs.emplace(pair_id).second) {
         continue;
       }
 
+      // 估计两张图像之间的几何关系（本质矩阵E或基础矩阵F）
+      // 如果估计成功（匹配数量足够、RANSAC内点比例高、重投影误差小等），
+      // 则找到了合适的初始图像对
       if (IncrementalMapperImpl::EstimateInitialTwoViewGeometry(
               options, database_cache, image_id1, image_id2, cam2_from_cam1)) {
         return true;
@@ -292,7 +324,8 @@ bool IncrementalMapperImpl::FindInitialImagePair(
     }
   }
 
-  // No suitable pair found in entire dataset.
+  // 遍历完所有候选图像对后仍未找到合适的初始图像对
+  // 将图像ID重置为无效值
   image_id1 = kInvalidImageId;
   image_id2 = kInvalidImageId;
 
