@@ -919,8 +919,21 @@ class DefaultBundleAdjuster : public BundleAdjuster {
   std::unordered_map<point3D_t, size_t> point3D_num_observations_;
 };
 
+/**
+ * [功能描述]：带位姿先验的光束法平差优化器。
+ *            利用GPS/GNSS等外部位置先验信息约束重建，使重建结果具有真实尺度和地理坐标。
+ *            继承自BundleAdjuster基类。
+ */
 class PosePriorBundleAdjuster : public BundleAdjuster {
  public:
+  /**
+   * [功能描述]：构造函数，初始化带位姿先验的BA优化器。
+   * @param options：基本BA配置选项。
+   * @param prior_options：位姿先验相关的配置选项。
+   * @param config：BA配置，指定哪些图像/相机参与优化。
+   * @param pose_priors：图像ID到位姿先验的映射表（通常来自GPS/GNSS数据）。
+   * @param reconstruction：待优化的重建对象引用。
+   */
   PosePriorBundleAdjuster(BundleAdjustmentOptions options,
                           PosePriorBundleAdjustmentOptions prior_options,
                           BundleAdjustmentConfig config,
@@ -930,27 +943,32 @@ class PosePriorBundleAdjuster : public BundleAdjuster {
         prior_options_(prior_options),
         pose_priors_(std::move(pose_priors)),
         reconstruction_(reconstruction) {
+    // 尝试将重建对齐到位姿先验坐标系
     const bool use_prior_position = AlignReconstruction();
 
-    // Fix 7-DOFs of BA problem if not enough valid pose priors.
+    // 根据是否有足够的有效位姿先验来决定如何固定BA问题的7自由度
     if (use_prior_position) {
-      // Normalize the reconstruction to avoid any numerical instability but
-      // do not transform priors as they will be transformed when added to
-      // ceres::Problem.
+      // 有位姿先验：对重建进行归一化以避免数值不稳定
+      // 注意：不变换先验本身，先验会在添加到ceres::Problem时进行变换
       normalized_from_metric_ = reconstruction_.Normalize(/*fixed_scale=*/true);
     } else {
+      // 无位姿先验：通过固定三个3D点来固定尺度规范
       config_.FixGauge(BundleAdjustmentGauge::THREE_POINTS);
     }
 
+    // 创建默认BA优化器用于处理基本的重投影误差
     default_bundle_adjuster_ = std::make_unique<DefaultBundleAdjuster>(
         options_, config_, reconstruction);
 
+    // 如果使用位姿先验，将先验约束添加到优化问题中
     if (use_prior_position) {
+      // 如果配置了鲁棒损失函数，使用Cauchy损失减少离群值影响
       if (prior_options_.use_robust_loss_on_prior_position) {
         prior_loss_function_ = std::make_unique<ceres::CauchyLoss>(
             prior_options_.prior_position_loss_scale);
       }
 
+      // 遍历所有参与优化的图像，添加对应的位姿先验约束
       for (const image_t image_id : config_.Images()) {
         const auto pose_prior_it = pose_priors_.find(image_id);
         if (pose_prior_it != pose_priors_.end()) {
@@ -961,21 +979,30 @@ class PosePriorBundleAdjuster : public BundleAdjuster {
     }
   }
 
+  /**
+   * [功能描述]：执行BA优化求解。
+   * @return ceres求解器的摘要信息，包含收敛状态、迭代次数等。
+   */
   ceres::Solver::Summary Solve() override {
     ceres::Solver::Summary summary;
     std::shared_ptr<ceres::Problem> problem =
         default_bundle_adjuster_->Problem();
+
+    // 如果没有残差项，直接返回空摘要
     if (problem->NumResiduals() == 0) {
       return summary;
     }
 
+    // 创建求解器选项并执行优化
     const ceres::Solver::Options solver_options =
         options_.CreateSolverOptions(config_, *problem);
 
     ceres::Solve(solver_options, problem.get(), &summary);
 
+    // 将重建从归一化坐标系变换回真实尺度坐标系
     reconstruction_.Transform(Inverse(normalized_from_metric_));
 
+    // 根据配置输出优化摘要
     if (options_.print_summary || VLOG_IS_ON(1)) {
       PrintSolverSummary(summary, "Pose Prior Bundle adjustment report");
     }
@@ -983,57 +1010,82 @@ class PosePriorBundleAdjuster : public BundleAdjuster {
     return summary;
   }
 
+  /**
+   * [功能描述]：获取ceres优化问题对象的引用。
+   * @return 指向ceres::Problem的共享指针引用。
+   */
   std::shared_ptr<ceres::Problem>& Problem() override {
     return default_bundle_adjuster_->Problem();
   }
 
+  /**
+   * [功能描述]：将单个图像的位姿先验约束添加到优化问题中。
+   * @param image_id：图像ID。
+   * @param prior：该图像的位姿先验信息（包含位置和协方差）。
+   * @param reconstruction：重建对象引用。
+   */
   void AddPosePriorToProblem(image_t image_id,
                              const PosePrior& prior,
                              Reconstruction& reconstruction) {
+    // 验证先验数据的有效性
     if (!prior.IsValid() || !prior.IsCovarianceValid()) {
       LOG(ERROR) << "Could not add prior for image #" << image_id;
       return;
     }
 
     Image& image = reconstruction.Image(image_id);
+    // 仅对简单帧（非多相机Rig）的图像施加先验约束
     if (!image.HasTrivialFrame()) {
-      // TODO(jsch): Only enforce the pose prior on the reference sensor. This
-      // fails if only a non-reference sensor image has a corresponding pose
-      // prior stored. This will be replaced with dedicated modeling of a
-      // GNSS/GPS sensor.
+      // TODO(jsch): 仅在参考传感器上施加位姿先验。
+      // 如果只有非参考传感器图像有对应的位姿先验，当前实现会失败。
+      // 未来将用专门的GNSS/GPS传感器建模来替代。
       return;
     }
 
     THROW_CHECK(image.HasPose());
+    // 获取相机位姿的引用（从世界坐标系到相机坐标系的刚体变换）
     Rigid3d& cam_from_world = image.FramePtr()->RigFromWorld();
 
     std::shared_ptr<ceres::Problem>& problem =
         default_bundle_adjuster_->Problem();
 
+    // 获取平移参数块指针
     double* cam_from_world_translation = cam_from_world.translation.data();
+    // 如果该参数块不在优化问题中，跳过
     if (!problem->HasParameterBlock(cam_from_world_translation)) {
       return;
     }
 
-    // cam_from_world.rotation is normalized in AddImageToProblem()
+    // 获取旋转参数块指针（四元数已在AddImageToProblem()中归一化）
     double* cam_from_world_rotation = cam_from_world.rotation.coeffs().data();
 
+    // 添加位姿先验残差块：使用协方差加权的绝对位置先验代价函数
     problem->AddResidualBlock(
         CovarianceWeightedCostFunctor<AbsolutePosePositionPriorCostFunctor>::
             Create(prior.position_covariance,
-                   normalized_from_metric_ * prior.position),
-        prior_loss_function_.get(),
+                   normalized_from_metric_ * prior.position),  // 将先验位置变换到归一化坐标系
+        prior_loss_function_.get(),  // 可选的鲁棒损失函数
         cam_from_world_rotation,
         cam_from_world_translation);
   }
 
+  /**
+   * [功能描述]：将重建对齐到位姿先验坐标系（通常是GPS/地理坐标系）。
+   *            使用RANSAC鲁棒估计相似变换（Sim3）。
+   * @return true表示对齐成功，false表示对齐失败（无足够有效先验）。
+   */
   bool AlignReconstruction() {
     RANSACOptions ransac_options = prior_options_.alignment_ransac_options;
+
+    // 如果未指定最大误差阈值，根据先验协方差自动计算
     if (ransac_options.max_error <= 0) {
       double max_stddev_sum = 0;
       size_t num_valid_covs = 0;
+
+      // 遍历所有位姿先验，计算协方差最大特征值的平方根（最大标准差）
       for (const auto& [_, pose_prior] : pose_priors_) {
         if (pose_prior.IsCovarianceValid()) {
+          // 计算协方差矩阵的最大特征值，取平方根得到最大标准差
           const double max_stddev =
               std::sqrt(Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(
                             pose_prior.position_covariance)
@@ -1043,31 +1095,38 @@ class PosePriorBundleAdjuster : public BundleAdjuster {
           ++num_valid_covs;
         }
       }
+
+      // 如果没有有效协方差，无法进行对齐
       if (num_valid_covs == 0) {
         LOG(WARNING) << "No pose priors with valid covariance found.";
         return false;
       }
-      // Set max error at the 3 sigma confidence interval. Assumes no
-      // outliers.
+
+      // 使用3σ置信区间作为最大误差阈值（假设无离群值）
       ransac_options.max_error = 3 * max_stddev_sum / num_valid_covs;
     }
 
     VLOG(2) << "Robustly aligning reconstruction with max_error="
             << ransac_options.max_error;
 
+    // 使用RANSAC鲁棒估计从原始坐标系到真实尺度坐标系的Sim3变换
     Sim3d metric_from_orig;
     const bool success = AlignReconstructionToPosePriors(
         reconstruction_, pose_priors_, ransac_options, &metric_from_orig);
 
+    // 如果对齐成功，应用变换
     if (success) {
       reconstruction_.Transform(metric_from_orig);
     } else {
       LOG(WARNING) << "Alignment w.r.t. prior positions failed";
     }
 
+    // 详细日志：输出对齐误差统计
     if (VLOG_IS_ON(2) && success) {
       std::vector<double> verr2_wrt_prior;
       verr2_wrt_prior.reserve(reconstruction_.NumRegImages());
+
+      // 计算每张图像相对于先验位置的误差平方
       for (const image_t image_id : reconstruction_.RegImageIds()) {
         const auto pose_prior_it = pose_priors_.find(image_id);
         if (pose_prior_it != pose_priors_.end() &&
@@ -1079,6 +1138,7 @@ class PosePriorBundleAdjuster : public BundleAdjuster {
         }
       }
 
+      // 输出RMSE和中位数误差
       VLOG(2) << "Alignment error w.r.t. prior positions:\n"
               << "  - rmse:   " << std::sqrt(Mean(verr2_wrt_prior)) << '\n'
               << "  - median: " << std::sqrt(Median(verr2_wrt_prior)) << '\n';
@@ -1088,13 +1148,19 @@ class PosePriorBundleAdjuster : public BundleAdjuster {
   }
 
  private:
+  // 位姿先验BA配置选项
   const PosePriorBundleAdjustmentOptions prior_options_;
+  // 图像ID到位姿先验的映射表
   const std::unordered_map<image_t, PosePrior> pose_priors_;
+  // 待优化的重建对象引用
   Reconstruction& reconstruction_;
 
+  // 默认BA优化器（处理基本的重投影误差）
   std::unique_ptr<DefaultBundleAdjuster> default_bundle_adjuster_;
+  // 位姿先验的鲁棒损失函数（可选，用于抑制离群值）
   std::unique_ptr<ceres::LossFunction> prior_loss_function_;
 
+  // 从真实尺度坐标系到归一化坐标系的Sim3变换
   Sim3d normalized_from_metric_;
 };
 

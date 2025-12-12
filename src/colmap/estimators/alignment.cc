@@ -237,34 +237,52 @@ bool AlignReconstructionToLocations(
   return true;
 }
 
+/**
+ * [功能描述]：将重建对齐到位姿先验坐标系（通常是GPS/地理坐标系）。
+ *            通过匹配重建中的相机位置与对应的位姿先验位置，估计Sim3相似变换。
+ * @param src_reconstruction：源重建对象，包含待对齐的相机位姿。
+ * @param tgt_pose_priors：目标位姿先验映射表（图像ID→位姿先验，通常来自GPS数据）。
+ * @param ransac_options：RANSAC配置选项，用于鲁棒估计。
+ * @param tgt_from_src：输出参数，从源坐标系到目标坐标系的Sim3相似变换。
+ * @return true表示对齐成功，false表示对齐失败（有效先验不足3个）。
+ */
 bool AlignReconstructionToPosePriors(
     const Reconstruction& src_reconstruction,
     const std::unordered_map<image_t, PosePrior>& tgt_pose_priors,
     const RANSACOptions& ransac_options,
     Sim3d* tgt_from_src) {
+  // 创建源点（重建中的相机位置）和目标点（先验位置）的向量
   std::vector<Eigen::Vector3d> src;
   std::vector<Eigen::Vector3d> tgt;
   src.reserve(tgt_pose_priors.size());
   tgt.reserve(tgt_pose_priors.size());
 
+  // 遍历所有已注册的图像，收集有效的对应点对
   for (const image_t image_id : src_reconstruction.RegImageIds()) {
     const auto pose_prior_it = tgt_pose_priors.find(image_id);
+    // 检查该图像是否有有效的位姿先验
     if (pose_prior_it != tgt_pose_priors.end() &&
         pose_prior_it->second.IsValid()) {
       const auto& image = src_reconstruction.Image(image_id);
+      // 源点：重建中的相机投影中心位置
       src.push_back(image.ProjectionCenter());
+      // 目标点：位姿先验中的位置（如GPS坐标）
       tgt.push_back(pose_prior_it->second.position);
     }
   }
 
+  // Sim3变换至少需要3个对应点对才能求解
   if (src.size() < 3) {
     LOG(WARNING) << "Not enough valid pose priors for alignment";
     return false;
   }
 
+  // 根据是否设置了RANSAC误差阈值，选择不同的估计方法
   if (ransac_options.max_error > 0) {
+    // 使用RANSAC鲁棒估计Sim3变换，可处理离群值
     return EstimateSim3dRobust(src, tgt, ransac_options, *tgt_from_src).success;
   }
+  // 使用普通最小二乘估计Sim3变换（假设无离群值）
   return EstimateSim3d(src, tgt, *tgt_from_src);
 }
 

@@ -74,26 +74,43 @@ IncrementalMapper::IncrementalMapper(
       obs_manager_(nullptr),
       triangulator_(nullptr) {}
 
+/**
+ * [功能描述]：开始一个新的增量式三维重建过程，初始化重建所需的核心组件和状态。
+ * @param reconstruction：指向 Reconstruction 对象的共享指针，表示要进行的三维重建实例。
+ * @return 无返回值。
+ */
 void IncrementalMapper::BeginReconstruction(
     const std::shared_ptr<class Reconstruction>& reconstruction) {
+  // 确保当前没有正在进行的重建，避免重复初始化
   THROW_CHECK(reconstruction_ == nullptr);
+
+  // 保存重建对象的引用，并从数据库缓存中加载已有的重建数据
   reconstruction_ = reconstruction;
   reconstruction_->Load(*database_cache_);
+
+  // 创建观测管理器，用于管理图像观测点与3D点之间的对应关系
   obs_manager_ = std::make_shared<class ObservationManager>(
       *reconstruction_, database_cache_->CorrespondenceGraph());
+
+  // 创建增量三角化器，用于在重建过程中进行特征点的三角化
   triangulator_ = std::make_shared<IncrementalTriangulator>(
       database_cache_->CorrespondenceGraph(), *reconstruction_, obs_manager_);
 
+  // 初始化注册统计信息：共享注册图像数量置零，清空每个相机的注册图像计数
   reg_stats_.num_shared_reg_images = 0;
   reg_stats_.num_reg_images_per_camera.clear();
+
+  // 遍历重建中已注册的所有帧ID，触发帧注册事件以更新统计信息
   for (const frame_t frame_id : reconstruction_->RegFrameIds()) {
     RegisterFrameEvent(frame_id);
   }
 
+  // 将已注册的帧ID存储到集合中，用于后续快速查找已存在的帧
   existing_frame_ids_ =
       std::unordered_set<image_t>(reconstruction->RegFrameIds().begin(),
                                   reconstruction->RegFrameIds().end());
 
+  // 清空过滤帧集合和注册尝试次数记录，为新的重建过程做准备
   filtered_frames_.clear();
   reg_stats_.num_reg_trials.clear();
 }
@@ -134,42 +151,63 @@ std::vector<image_t> IncrementalMapper::FindNextImages(const Options& options) {
       options, *obs_manager_, filtered_frames_, reg_stats_.num_reg_trials);
 }
 
+/**
+ * [功能描述]：注册初始图像对，作为增量式SfM重建的起点。
+ *            将第一张图像设为世界坐标系原点，第二张图像根据两视图几何关系设置位姿。
+ * @param options：增量式重建的配置选项。
+ * @param image_id1：第一张图像的ID，将被设置为世界坐标系原点。
+ * @param image_id2：第二张图像的ID。
+ * @param cam2_from_cam1：从相机1坐标系到相机2坐标系的刚体变换（相对位姿）。
+ * @return 无返回值。
+ */
 void IncrementalMapper::RegisterInitialImagePair(
     const Options& options,
     const image_t image_id1,
     const image_t image_id2,
     const Rigid3d& cam2_from_cam1) {
+  // 确保重建对象和观测管理器已初始化
   THROW_CHECK_NOTNULL(reconstruction_);
   THROW_CHECK_NOTNULL(obs_manager_);
+  // 确保当前没有已注册的帧，即这是第一对初始图像
   THROW_CHECK_EQ(reconstruction_->NumRegFrames(), 0);
 
+  // 验证配置选项的有效性
   THROW_CHECK(options.Check());
 
+  // 更新两张图像的初始化注册尝试次数和总注册尝试次数
   reg_stats_.init_num_reg_trials[image_id1] += 1;
   reg_stats_.init_num_reg_trials[image_id2] += 1;
   reg_stats_.num_reg_trials[image_id1] += 1;
   reg_stats_.num_reg_trials[image_id2] += 1;
 
+  // 生成图像对ID并记录到初始图像对集合中
   const image_pair_t pair_id = ImagePairToPairId(image_id1, image_id2);
   reg_stats_.init_image_pairs.insert(pair_id);
 
+  // 获取两张图像的引用
   Image& image1 = reconstruction_->Image(image_id1);
   Image& image2 = reconstruction_->Image(image_id2);
 
   //////////////////////////////////////////////////////////////////////////////
   // Apply two-view geometry
+  // 应用两视图几何关系
   //////////////////////////////////////////////////////////////////////////////
 
+  // 将第一张图像的相机位姿设为单位变换（世界坐标系原点）
   image1.FramePtr()->SetCamFromWorld(image1.CameraId(), Rigid3d());
+  // 将第二张图像的相机位姿设为相对于第一张图像的变换
   image2.FramePtr()->SetCamFromWorld(image2.CameraId(), cam2_from_cam1);
 
   //////////////////////////////////////////////////////////////////////////////
   // Update Reconstruction
+  // 更新重建数据结构
   //////////////////////////////////////////////////////////////////////////////
 
+  // 在重建中注册两个帧
   reconstruction_->RegisterFrame(image1.FrameId());
   reconstruction_->RegisterFrame(image2.FrameId());
 
+  // 触发帧注册事件，更新注册统计信息
   RegisterFrameEvent(image1.FrameId());
   RegisterFrameEvent(image2.FrameId());
 }
@@ -600,15 +638,29 @@ bool IncrementalMapper::RegisterNextGeneralFrame(const Options& options,
   return true;
 }
 
+/**
+ * [功能描述]：对指定图像进行三角化，通过与其他已注册图像的特征匹配生成新的3D点。
+ * @param tri_options：三角化的配置选项，控制三角化的行为和阈值。
+ * @param image_id：要进行三角化的图像ID。
+ * @return 新增的三角化观测点数量。
+ */
 size_t IncrementalMapper::TriangulateImage(
     const IncrementalTriangulator::Options& tri_options,
     const image_t image_id) {
+  // 确保重建对象已初始化
   THROW_CHECK_NOTNULL(reconstruction_);
+
+  // 输出该图像当前已关联的3D点数量（继承自之前的观测）
   VLOG(1) << "=> Continued observations: "
           << reconstruction_->Image(image_id).NumPoints3D();
+
+  // 调用三角化器对该图像进行三角化，返回新增的观测点数量
   const size_t num_tris =
       triangulator_->TriangulateImage(tri_options, image_id);
+
+  // 输出新增的观测点数量
   VLOG(1) << "=> Added observations: " << num_tris;
+
   return num_tris;
 }
 
@@ -767,15 +819,25 @@ IncrementalMapper::AdjustLocalBundle(
   return report;
 }
 
+/**
+ * [功能描述]：执行全局光束法平差（Bundle Adjustment），同时优化所有已注册图像的相机位姿和3D点坐标。
+ * @param options：增量式重建的配置选项。
+ * @param ba_options：光束法平差的配置选项，包含求解器参数等。
+ * @return true表示优化成功，false表示优化失败。
+ */
 bool IncrementalMapper::AdjustGlobalBundle(
     const Options& options, const BundleAdjustmentOptions& ba_options) {
+  // 确保重建对象和观测管理器已初始化
   THROW_CHECK_NOTNULL(reconstruction_);
   THROW_CHECK_NOTNULL(obs_manager_);
 
+  // 复制BA选项以便自定义修改
   BundleAdjustmentOptions custom_ba_options = ba_options;
-  // Use stricter convergence criteria for first registered images.
+
+  // 对于前期注册的图像（少于10帧），使用更严格的收敛条件以获得更精确的初始重建
   const size_t kMinNumRegFramesForFastBA = 10;
   if (reconstruction_->NumRegFrames() < kMinNumRegFramesForFastBA) {
+    // 收敛容差缩小10倍，迭代次数翻倍
     custom_ba_options.solver_options.function_tolerance /= 10;
     custom_ba_options.solver_options.gradient_tolerance /= 10;
     custom_ba_options.solver_options.parameter_tolerance /= 10;
@@ -783,10 +845,10 @@ bool IncrementalMapper::AdjustGlobalBundle(
     custom_ba_options.solver_options.max_linear_solver_iterations = 200;
   }
 
-  // Avoid degeneracies in bundle adjustment.
+  // 过滤负深度的观测点，避免光束法平差中的退化情况
   obs_manager_->FilterObservationsWithNegativeDepth();
 
-  // Configure bundle adjustment.
+  // 配置光束法平差：将所有已注册帧中的图像添加到BA配置中
   BundleAdjustmentConfig ba_config;
   for (const frame_t frame_id : reconstruction_->RegFrameIds()) {
     const Frame& frame = reconstruction_->Frame(frame_id);
@@ -795,11 +857,12 @@ bool IncrementalMapper::AdjustGlobalBundle(
     }
   }
 
+  // 确保至少有2张图像用于全局BA
   THROW_CHECK_GE(ba_config.NumImages(), 2) << "At least two images must be "
                                               "registered for global "
                                               "bundle-adjustment";
 
-  // Fix the existing images, if option specified.
+  // 如果选项指定固定已存在的帧，则将这些帧的位姿设为常量（不优化）
   if (options.fix_existing_frames) {
     for (const frame_t frame_id : reconstruction_->RegFrameIds()) {
       if (existing_frame_ids_.count(frame_id)) {
@@ -808,6 +871,7 @@ bool IncrementalMapper::AdjustGlobalBundle(
     }
   }
 
+  // 将指定的Rig中所有传感器的相对位姿设为常量
   for (const auto& rig_id : options.constant_rigs) {
     const Rig& rig = reconstruction_->Rig(rig_id);
     for (const auto& [sensor_id, _] : rig.Sensors()) {
@@ -815,29 +879,31 @@ bool IncrementalMapper::AdjustGlobalBundle(
     }
   }
 
+  // 将指定的相机内参设为常量（不优化）
   for (const auto& camera_id : options.constant_cameras) {
     ba_config.SetConstantCamIntrinsics(camera_id);
   }
 
-  // Only use prior pose if at least 3 images have been registered.
+  // 仅当至少有3张图像注册时才使用位姿先验
   const bool use_prior_position =
       options.use_prior_position && ba_config.NumImages() > 2;
 
+  // 根据是否使用位姿先验创建相应的BA优化器
   std::unique_ptr<BundleAdjuster> bundle_adjuster;
   if (!use_prior_position) {
-    // Fixing the gauge with two cameras leads to a more stable optimization
-    // with fewer steps as compared to fixing three points.
-    // TODO(jsch): Investigate whether it is safe to not fix the gauge at all,
-    // as initial experiments show that it is even faster.
+    // 不使用位姿先验：通过固定两个相机位姿来固定尺度规范（Gauge）
+    // 相比固定三个点，这种方式优化更稳定、收敛更快
+    // TODO(jsch): 研究是否可以完全不固定规范，初步实验表明这样更快
     ba_config.FixGauge(BundleAdjustmentGauge::TWO_CAMS_FROM_WORLD);
     bundle_adjuster = CreateDefaultBundleAdjuster(
         std::move(custom_ba_options), ba_config, *reconstruction_);
   } else {
+    // 使用位姿先验：配置位姿先验BA选项
     PosePriorBundleAdjustmentOptions prior_options;
     prior_options.use_robust_loss_on_prior_position =
-        options.use_robust_loss_on_prior_position;
-    prior_options.prior_position_loss_scale = options.prior_position_loss_scale;
-    prior_options.alignment_ransac_options.random_seed = options.random_seed;
+        options.use_robust_loss_on_prior_position;  // 是否对位姿先验使用鲁棒损失函数
+    prior_options.prior_position_loss_scale = options.prior_position_loss_scale;  // 位姿先验损失缩放因子
+    prior_options.alignment_ransac_options.random_seed = options.random_seed;  // RANSAC随机种子
     bundle_adjuster =
         CreatePosePriorBundleAdjuster(std::move(custom_ba_options),
                                       prior_options,
@@ -846,6 +912,7 @@ bool IncrementalMapper::AdjustGlobalBundle(
                                       *reconstruction_);
   }
 
+  // 执行BA优化，返回是否成功（非FAILURE即为成功）
   return bundle_adjuster->Solve().termination_type != ceres::FAILURE;
 }
 
@@ -1016,25 +1083,40 @@ std::vector<image_t> IncrementalMapper::FindLocalBundle(
       options, image_id, *reconstruction_);
 }
 
+/**
+ * [功能描述]：处理帧注册事件，更新与帧、图像、相机相关的注册统计信息。
+ * @param frame_id：要处理的帧ID。
+ * @return 无返回值。
+ */
 void IncrementalMapper::RegisterFrameEvent(const frame_t frame_id) {
+  // 根据帧ID获取对应的Frame对象
   const Frame& frame = reconstruction_->Frame(frame_id);
 
+  // 获取该帧所属Rig的注册帧计数引用，并递增
   size_t& num_reg_frames_for_rig =
       reg_stats_.num_reg_frames_per_rig[frame.RigId()];
   num_reg_frames_for_rig += 1;
 
+  // 遍历该帧中包含的所有图像
   for (const data_t& data_id : frame.ImageIds()) {
+    // 获取图像对象
     const Image& image = reconstruction_->Image(data_id.id);
 
+    // 获取该图像所属相机的注册图像计数引用，并递增
     size_t& num_reg_images_for_camera =
         reg_stats_.num_reg_images_per_camera[image.CameraId()];
     num_reg_images_for_camera += 1;
 
+    // 获取该图像的注册次数引用，并递增
     size_t& num_regs_for_image = reg_stats_.num_registrations[data_id.id];
     num_regs_for_image += 1;
+
+    // 根据注册次数更新统计信息
     if (num_regs_for_image == 1) {
+      // 首次注册：增加总注册图像数
       reg_stats_.num_total_reg_images += 1;
     } else if (num_regs_for_image > 1) {
+      // 多次注册：增加共享注册图像数（表示该图像被多个重建共享使用）
       reg_stats_.num_shared_reg_images += 1;
     }
   }

@@ -317,19 +317,37 @@ size_t ObservationManager::FilterAllPoints3D(const double max_reproj_error,
   return num_filtered_observations;
 }
 
+/**
+ * [功能描述]：过滤掉具有负深度的观测点，即删除3D点位于相机后方的无效观测。
+ *            这些观测通常由错误的三角化或匹配产生，会导致光束法平差退化。
+ * @return 被过滤（删除）的观测点数量。
+ */
 size_t ObservationManager::FilterObservationsWithNegativeDepth() {
+  // 初始化过滤计数器
   size_t num_filtered = 0;
+
+  // 遍历所有已注册的帧
   for (const frame_t frame_id : reconstruction_.RegFrameIds()) {
+    // 遍历每个帧中的所有图像
     for (const data_t& data_id : reconstruction_.Frame(frame_id).ImageIds()) {
       const Image& image = reconstruction_.Image(data_id.id);
+      // 获取相机从世界坐标系到相机坐标系的变换矩阵（3x4）
       const Eigen::Matrix3x4d cam_from_world = image.CamFromWorld().ToMatrix();
+
+      // 遍历该图像中的所有2D特征点
       for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
            ++point2D_idx) {
         const Point2D& point2D = image.Point2D(point2D_idx);
+
+        // 检查该2D点是否关联了3D点
         if (point2D.HasPoint3D()) {
+          // 获取关联的3D点
           const struct Point3D& point3D =
               reconstruction_.Point3D(point2D.point3D_id);
+
+          // 检查3D点在该相机视角下是否具有正深度（即在相机前方）
           if (!HasPointPositiveDepth(cam_from_world, point3D.xyz)) {
+            // 深度为负，说明3D点在相机后方，删除该无效观测
             DeleteObservation(data_id.id, point2D_idx);
             num_filtered += 1;
           }
@@ -337,6 +355,7 @@ size_t ObservationManager::FilterObservationsWithNegativeDepth() {
       }
     }
   }
+
   return num_filtered;
 }
 
