@@ -376,38 +376,66 @@ bool BundleAdjustmentOptions::Check() const {
 
 namespace {
 
+/**
+ * [功能描述]：配置相机内参的参数化方式。
+ *            根据优化选项和配置，决定哪些相机内参保持常量、哪些参与优化。
+ *            支持对焦距、主点、畸变参数等进行独立控制。
+ * @param options：光束法平差选项，控制是否优化各类内参。
+ * @param config：光束法平差配置，指定哪些相机内参是常量。
+ * @param camera_ids：需要参数化的相机ID集合。
+ * @param reconstruction：三维重建数据引用。
+ * @param problem：Ceres优化问题引用。
+ */
 void ParameterizeCameras(const BundleAdjustmentOptions& options,
                          const BundleAdjustmentConfig& config,
                          const std::set<camera_t>& camera_ids,
                          Reconstruction& reconstruction,
                          ceres::Problem& problem) {
+  // 判断是否所有相机内参都保持常量
+  // 当焦距、主点、额外参数都不优化时，整个相机内参向量为常量
   const bool constant_camera = !options.refine_focal_length &&
                                !options.refine_principal_point &&
                                !options.refine_extra_params;
+
+  // 遍历所有需要参数化的相机
   for (const camera_t camera_id : camera_ids) {
     Camera& camera = reconstruction.Camera(camera_id);
 
     if (constant_camera || config.HasConstantCamIntrinsics(camera_id)) {
+      // 情况1：整个相机内参向量保持常量
+      // 条件：全局设置不优化任何内参 或 该相机被显式配置为常量
       problem.SetParameterBlockConstant(camera.params.data());
     } else {
+      // 情况2：部分内参可变，需要使用子集流形（Subset Manifold）
+      // 收集需要保持常量的参数索引
       std::vector<int> const_camera_params;
 
+      // 如果不优化焦距，将焦距参数索引加入常量列表
+      // 注意：不同相机模型的焦距参数数量可能不同（如fx, fy）
       if (!options.refine_focal_length) {
         const span<const size_t> params_idxs = camera.FocalLengthIdxs();
         const_camera_params.insert(
             const_camera_params.end(), params_idxs.begin(), params_idxs.end());
       }
+
+      // 如果不优化主点，将主点参数索引加入常量列表
+      // 主点通常为 (cx, cy)
       if (!options.refine_principal_point) {
         const span<const size_t> params_idxs = camera.PrincipalPointIdxs();
         const_camera_params.insert(
             const_camera_params.end(), params_idxs.begin(), params_idxs.end());
       }
+
+      // 如果不优化额外参数，将额外参数索引加入常量列表
+      // 额外参数包括畸变系数（如k1, k2, p1, p2等）
       if (!options.refine_extra_params) {
         const span<const size_t> params_idxs = camera.ExtraParamsIdxs();
         const_camera_params.insert(
             const_camera_params.end(), params_idxs.begin(), params_idxs.end());
       }
 
+      // 如果存在需要保持常量的参数，设置子集流形
+      // 子集流形允许参数向量中的部分元素固定，其余元素参与优化
       if (const_camera_params.size() > 0) {
         SetSubsetManifold(static_cast<int>(camera.params.size()),
                           const_camera_params,
@@ -418,64 +446,119 @@ void ParameterizeCameras(const BundleAdjustmentOptions& options,
   }
 }
 
+/**
+ * [功能描述]：通过固定三个3D点来消除光束法平差的规范自由度（Gauge Freedom）。
+ *            光束法平差存在7个自由度（3平移+3旋转+1尺度），需要通过约束来消除。
+ *            该结构体选择三个线性无关的点进行固定，从而固定重建的位置、朝向和尺度。
+ */
 struct FixedGaugeWithThreePoints {
-  // The number of fixed points for the Gauge.
+  // 已固定的点数量，最多为3个
   Eigen::Index num_fixed_points = 0;
-  // The coordinates of the fixed points as columns.
+  // 存储已固定点的坐标，每列为一个3D点坐标
+  // 矩阵形状：3x3，第i列存储第i个固定点的(x,y,z)坐标
   Eigen::Matrix3d fixed_points = Eigen::Matrix3d::Zero();
+
+  /**
+   * [功能描述]：尝试添加一个固定点。
+   *            只有当该点与已有固定点线性无关时才会被添加，
+   *            以确保三个点能够完全约束7自由度中的6个（位置和朝向）。
+   * @param point：候选的3D点坐标，形状为(3,)的向量。
+   * @return 如果点被成功添加返回true，否则返回false。
+   *         返回false的情况：已有3个固定点，或该点与已有点线性相关。
+   */
   bool MaybeAddFixedPoint(const Eigen::Vector3d& point) {
+    // 已经有3个固定点，无法再添加
     if (num_fixed_points >= 3) {
       return false;
     }
+
+    // 将候选点暂时放入矩阵的对应列
     fixed_points.col(num_fixed_points) = point;
+
+    // 使用列主元Householder QR分解计算矩阵的秩
+    // 如果秩增加了，说明新点与已有点线性无关，可以接受
     if (fixed_points.colPivHouseholderQr().rank() > num_fixed_points) {
       ++num_fixed_points;
       return true;
     } else {
+      // 新点与已有点线性相关（共线或共面），拒绝该点
+      // 清空该列，等待下一个候选点
       fixed_points.col(num_fixed_points).setZero();
       return false;
     }
   }
 };
 
+/**
+ * [功能描述]：通过固定三个线性无关的3D点来消除光束法平差的规范自由度。
+ *            该函数分两步执行：
+ *            1. 首先检查问题中是否已有足够的常量点可用于固定规范；
+ *            2. 若不足，则主动将一些可变点设为常量。
+ * @param point3D_num_observations：3D点ID到其观测数量的映射。
+ * @param reconstruction：三维重建数据引用。
+ * @param problem：Ceres优化问题引用。
+ */
 void FixGaugeWithThreePoints(
     const std::unordered_map<point3D_t, size_t>& point3D_num_observations,
     Reconstruction& reconstruction,
     ceres::Problem& problem) {
+  // 创建规范固定器，用于跟踪已选择的固定点
   FixedGaugeWithThreePoints fixed_gauge;
 
-  // First check if we already fixed enough points in the problem.
+  // ========== 第一步：检查已有的常量点是否足够 ==========
+  // 遍历所有3D点，查找已经被设为常量的点
+  // 如果已有3个线性无关的常量点，则无需额外操作
   for (const auto& [point3D_id, num_observations] : point3D_num_observations) {
     const Point3D& point3D = reconstruction.Point3D(point3D_id);
+    // 检查该点是否已是常量，并尝试添加为固定点
     if (problem.IsParameterBlockConstant(point3D.xyz.data()) &&
         fixed_gauge.MaybeAddFixedPoint(point3D.xyz) &&
         fixed_gauge.num_fixed_points >= 3) {
+      // 已找到3个线性无关的常量点，规范已固定，直接返回
       return;
     }
   }
 
-  // Otherwise, fix sufficient points in the problem.
+  // ========== 第二步：主动固定额外的点 ==========
+  // 如果已有常量点不足，需要将一些可变点设为常量
   for (const auto& [point3D_id, num_observations] : point3D_num_observations) {
     Point3D& point3D = reconstruction.Point3D(point3D_id);
+    // 检查该点是否为可变点，并尝试添加为固定点
     if (!problem.IsParameterBlockConstant(point3D.xyz.data()) &&
         fixed_gauge.MaybeAddFixedPoint(point3D.xyz)) {
+      // 该点线性无关，将其设为常量
       problem.SetParameterBlockConstant(point3D.xyz.data());
       if (fixed_gauge.num_fixed_points >= 3) {
+        // 已成功固定3个点，规范已固定，直接返回
         return;
       }
     }
   }
 
+  // 警告：未能找到足够的线性无关点来固定规范自由度
+  // 这可能发生在点数过少或所有点共线/共面的情况下
   LOG(WARNING)
       << "Failed to fix Gauge due to insufficient number of fixed points: "
       << fixed_gauge.num_fixed_points;
 }
 
-// Note that the following implementation does not handle all degenerate edge
-// cases well, e.g., where the selected two cameras are not well constrained
-// with respect to each other with shared observations. Furthermore, the
-// implementation could be more sophisticated for multi-camera rigs by selecting
-// camera pairs within a rig, etc.
+/**
+ * [功能描述]：通过固定两个相机的位姿来消除光束法平差的规范自由度。
+ *            固定第一个相机的完整位姿（6自由度：3旋转+3平移），
+ *            固定第二个相机平移向量中基线最大的那个分量（1自由度），
+ *            共消除7自由度（3平移+3旋转+1尺度）。
+ *
+ * 注意：该实现未处理所有退化边缘情况，例如：
+ *   - 选中的两个相机之间没有足够的共视观测约束；
+ *   - 对于多相机组（rig），可以更智能地在组内选择相机对。
+ *
+ * @param options：光束法平差选项。
+ * @param config：光束法平差配置。
+ * @param image_ids：参与优化的图像ID集合。
+ * @param point3D_num_observations：3D点观测数量映射（用于回退方案）。
+ * @param reconstruction：三维重建数据引用。
+ * @param problem：Ceres优化问题引用。
+ */
 void FixGaugeWithTwoCamsFromWorld(
     const BundleAdjustmentOptions& options,
     const BundleAdjustmentConfig& config,
@@ -483,29 +566,35 @@ void FixGaugeWithTwoCamsFromWorld(
     const std::unordered_map<point3D_t, size_t>& point3D_num_observations,
     Reconstruction& reconstruction,
     ceres::Problem& problem) {
-  // No need to fix the Gauge if all frames are constant.
+  // 如果所有帧的位姿都不需要优化（都是常量），则无需固定规范
   if (!options.refine_rig_from_world) {
     return;
   }
 
-  Image* image1 = nullptr;
-  Image* image2 = nullptr;
+  // 用于存储选中的两个图像指针
+  Image* image1 = nullptr;  // 第一个相机（将固定完整位姿）
+  Image* image2 = nullptr;  // 第二个相机（将固定平移的一个分量）
 
-  // First, search through the already fixed cameras in the problem.
+  // ========== 第一步：在已固定的相机中搜索 ==========
+  // 优先使用已经被配置为常量位姿的相机
   for (const image_t image_id : image_ids) {
     Image& image = reconstruction.Image(image_id);
+    // 条件：该相机是rig的参考传感器 且 其帧位姿被配置为常量
     if (image.FramePtr()->RigPtr()->IsRefSensor(
             image.CameraPtr()->SensorId()) &&
         config.HasConstantRigFromWorldPose(image.FrameId())) {
       if (image1 == nullptr) {
+        // 找到第一个常量位姿的相机
         image1 = &image;
       } else if (image1 != nullptr && image1->FrameId() != image.FrameId()) {
-        // No need to fix the Gauge if two frames are already fixed.
+        // 如果已有两个不同帧的常量位姿相机，规范已固定，无需额外操作
         return;
       }
     }
   }
 
+  // 辅助lambda：检查图像是否为已参数化的参考传感器
+  // 参考传感器是rig中用于定义rig坐标系的相机
   auto IsParameterizedRefSensor = [&problem](const Image& image) {
     return image.FramePtr()->RigPtr()->IsRefSensor(
                image.CameraPtr()->SensorId()) &&
@@ -513,21 +602,25 @@ void FixGaugeWithTwoCamsFromWorld(
                image.FramePtr()->RigFromWorld().translation.data());
   };
 
-  // Otherwise, search through the variable cameras in the problem.
-  Eigen::Index frame2_from_world_fixed_dim = 0;
+  // ========== 第二步：在可变相机中搜索 ==========
+  // 如果已固定相机不足，需要从可变相机中选择
+  Eigen::Index frame2_from_world_fixed_dim = 0;  // 记录第二相机要固定的平移分量索引
   for (const image_t image_id : image_ids) {
     Image& image = reconstruction.Image(image_id);
     if (image1 == nullptr && IsParameterizedRefSensor(image)) {
+      // 选择第一个可变相机作为image1
       image1 = &image;
     } else if (image1 != nullptr && image1->FrameId() != image.FrameId() &&
                IsParameterizedRefSensor(image)) {
-      // Check if one of the baseline dimensions is large enough and
-      // choose it as the fixed coordinate. If there is no such pair of
-      // frames, then the scale is not constrained well.
+      // 寻找与image1不同帧的第二个相机
+      // 计算两相机之间的基线向量（相对平移）
+      // baseline = T_1w * T_w2 的平移部分 = 相机2在相机1坐标系下的位置
       const Eigen::Vector3d baseline =
           (image1->FramePtr()->RigFromWorld() *
            Inverse(image.FramePtr()->RigFromWorld()))
               .translation;
+      // 选择基线中绝对值最大的分量作为要固定的维度
+      // 这样可以最好地约束尺度；如果基线太小，尺度约束会不稳定
       if (baseline.cwiseAbs().maxCoeff(&frame2_from_world_fixed_dim) > 1e-9) {
         image2 = &image;
         break;
@@ -535,11 +628,10 @@ void FixGaugeWithTwoCamsFromWorld(
     }
   }
 
-  // TODO(jsch): Notice that we could alternatively fall back to fixing the
-  // Gauge between two cameras in the same frame or in different frames. Since
-  // there are many different combinations to iterate through, we instead fall
-  // back to fixing the Gauge with three points for simplicity. Furthermore,
-  // once we support IMUs or other sensors, we should fix the Gauge differently.
+  // ========== 回退方案：使用三点固定规范 ==========
+  // TODO(jsch): 可以考虑在同一帧或不同帧的相机之间回退。
+  // 由于组合情况较多，这里简单地回退到三点固定方案。
+  // 未来支持IMU或其他传感器时，应采用不同的规范固定策略。
   if (image1 == nullptr || image2 == nullptr) {
     LOG(WARNING) << "Failed to fix Gauge with two cameras. "
                     "Falling back to fixing Gauge with three points.";
@@ -547,15 +639,22 @@ void FixGaugeWithTwoCamsFromWorld(
     return;
   }
 
+  // ========== 第三步：固定选中的两个相机 ==========
+  // 固定第一个相机的完整位姿（旋转+平移，共6自由度）
   Rigid3d& frame1_from_world = image1->FramePtr()->RigFromWorld();
   if (!config.HasConstantRigFromWorldPose(image1->FrameId())) {
+    // 将旋转四元数设为常量
     problem.SetParameterBlockConstant(
         frame1_from_world.rotation.coeffs().data());
+    // 将平移向量设为常量
     problem.SetParameterBlockConstant(frame1_from_world.translation.data());
   }
 
+  // 固定第二个相机平移向量中的一个分量（1自由度，用于约束尺度）
   Rigid3d& frame2_from_world = image2->FramePtr()->RigFromWorld();
   if (!config.HasConstantRigFromWorldPose(image2->FrameId())) {
+    // 使用子集流形固定平移向量中基线最大的那个分量
+    // 例如：如果x方向基线最大，则固定tx，让ty和tz可优化
     SetSubsetManifold(3,
                       {static_cast<int>(frame2_from_world_fixed_dim)},
                       &problem,
@@ -653,45 +752,73 @@ void ParameterizePoints(
   }
 }
 
+/**
+ * [功能描述]：默认的光束法平差（Bundle Adjustment）优化器类。
+ *            该类负责构建和求解非线性最小二乘优化问题，用于同时优化
+ *            相机位姿、相机内参和3D点坐标，最小化重投影误差。
+ *            继承自BundleAdjuster基类。
+ */
 class DefaultBundleAdjuster : public BundleAdjuster {
  public:
+  /**
+   * [功能描述]：构造函数，初始化光束法平差问题。
+   *            设置优化问题、添加图像和3D点观测、配置参数化方式、处理规范约束。
+   * @param options：光束法平差选项，控制优化行为（如损失函数、是否优化位姿等）。
+   * @param config：光束法平差配置，指定参与优化的图像、点和约束条件。
+   * @param reconstruction：三维重建数据，包含相机、图像、3D点等信息（引用传递，优化后会被修改）。
+   */
   DefaultBundleAdjuster(BundleAdjustmentOptions options,
                         BundleAdjustmentConfig config,
                         Reconstruction& reconstruction)
       : BundleAdjuster(std::move(options), std::move(config)),
+        // 根据配置选项创建损失函数（如Huber、Cauchy等鲁棒损失函数）
         loss_function_(std::unique_ptr<ceres::LossFunction>(
             options_.CreateLossFunction())) {
+    // 配置Ceres优化问题选项
     ceres::Problem::Options problem_options;
+    // 设置损失函数的所有权为外部管理，避免Problem析构时重复释放
     problem_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+    // 创建Ceres优化问题实例
     problem_ = std::make_shared<ceres::Problem>(problem_options);
 
-    // Set up problem
-    // Warning: AddPointsToProblem assumes that AddImageToProblem is called
-    // first. Do not change order of instructions!
+    // ========== 第一步：构建优化问题 ==========
+    // 警告：AddPointsToProblem假设AddImageToProblem已被先调用，
+    // 不要改变以下指令的顺序！
+    // 首先添加所有配置中的图像到优化问题
     for (const image_t image_id : config_.Images()) {
       AddImageToProblem(image_id, reconstruction);
     }
+    // 添加可变3D点（这些点的坐标会被优化）
     for (const auto point3D_id : config_.VariablePoints()) {
       AddPointToProblem(point3D_id, reconstruction);
     }
+    // 添加常量3D点（这些点的坐标保持固定，但仍参与约束）
     for (const auto point3D_id : config_.ConstantPoints()) {
       AddPointToProblem(point3D_id, reconstruction);
     }
 
+    // ========== 第二步：配置参数化方式 ==========
+    // 对相机内参进行参数化（设置哪些内参是常量/可变的）
     ParameterizeCameras(options_,
                         config_,
                         parameterized_camera_ids_,
                         reconstruction,
                         *problem_);
+    // 对图像位姿进行参数化（设置旋转使用四元数的流形约束等）
     ParameterizeImages(
         options_, config_, parameterized_image_ids_, reconstruction, *problem_);
+    // 对3D点进行参数化（设置常量点约束）
     ParameterizePoints(
         config_, point3D_num_observations_, reconstruction, *problem_);
 
+    // ========== 第三步：处理规范自由度（Gauge）约束 ==========
+    // 光束法平差存在7个自由度（3平移+3旋转+1尺度），需要固定以避免退化
     switch (config_.FixedGauge()) {
       case BundleAdjustmentGauge::UNSPECIFIED:
+        // 不指定规范约束，由用户自行处理
         break;
       case BundleAdjustmentGauge::TWO_CAMS_FROM_WORLD:
+        // 通过固定两个相机的位姿来固定规范自由度
         FixGaugeWithTwoCamsFromWorld(options_,
                                      config_,
                                      parameterized_image_ids_,
@@ -700,6 +827,7 @@ class DefaultBundleAdjuster : public BundleAdjuster {
                                      *problem_);
         break;
       case BundleAdjustmentGauge::THREE_POINTS:
+        // 通过固定三个3D点来固定规范自由度
         FixGaugeWithThreePoints(
             point3D_num_observations_, reconstruction, *problem_);
         break;
@@ -708,17 +836,25 @@ class DefaultBundleAdjuster : public BundleAdjuster {
     }
   }
 
+  /**
+   * [功能描述]：执行光束法平差优化求解。
+   * @return 返回Ceres求解器的汇总信息，包含迭代次数、收敛状态、最终代价等。
+   */
   ceres::Solver::Summary Solve() override {
     ceres::Solver::Summary summary;
+    // 如果没有残差项，直接返回空结果
     if (problem_->NumResiduals() == 0) {
       return summary;
     }
 
+    // 根据配置和问题规模创建求解器选项
     const ceres::Solver::Options solver_options =
         options_.CreateSolverOptions(config_, *problem_);
 
+    // 调用Ceres求解器进行优化
     ceres::Solve(solver_options, problem_.get(), &summary);
 
+    // 如果开启了打印摘要或详细日志，输出优化报告
     if (options_.print_summary || VLOG_IS_ON(1)) {
       PrintSolverSummary(summary, "Bundle adjustment report");
     }
@@ -726,87 +862,136 @@ class DefaultBundleAdjuster : public BundleAdjuster {
     return summary;
   }
 
+  /**
+   * [功能描述]：获取Ceres优化问题的共享指针。
+   * @return 返回指向ceres::Problem的共享指针引用，允许外部访问和修改问题。
+   */
   std::shared_ptr<ceres::Problem>& Problem() override { return problem_; }
 
+  /**
+   * [功能描述]：将指定图像添加到优化问题中。
+   *            根据图像是否具有简单帧（Trivial Frame）选择不同的处理方式。
+   * @param image_id：要添加的图像ID。
+   * @param reconstruction：三维重建数据引用。
+   */
   void AddImageToProblem(const image_t image_id,
                          Reconstruction& reconstruction) {
+    // 获取图像引用
     Image& image = reconstruction.Image(image_id);
 
+    // 根据帧类型选择处理方式
     if (image.HasTrivialFrame()) {
+      // 简单帧：相机直接与世界坐标系关联（无rig结构）
       AddImageWithTrivialFrame(image, reconstruction);
     } else {
+      // 非简单帧：相机是相机组（rig）的一部分
       AddImageWithNonTrivialFrame(image, reconstruction);
     }
   }
 
+  /**
+   * [功能描述]：添加具有简单帧的图像到优化问题。
+   *            简单帧表示相机直接与世界坐标系关联，没有相机组（rig）结构。
+   *            为图像中每个有3D点对应的2D观测添加重投影误差残差项。
+   * @param image：图像对象引用。
+   * @param reconstruction：三维重建数据引用。
+   */
   void AddImageWithTrivialFrame(Image& image, Reconstruction& reconstruction) {
+    // 获取相机对象引用
     Camera& camera = *image.CameraPtr();
 
+    // 断言检查：确保图像确实是简单帧
     THROW_CHECK(image.HasTrivialFrame());
+    // 获取相机从世界坐标系到相机坐标系的变换（cam_from_world = T_cw）
     Rigid3d& cam_from_world = image.FramePtr()->RigFromWorld();
 
+    // 判断相机位姿是否保持常量（不参与优化）
+    // 条件：不需要优化rig位姿 或 该帧被配置为常量位姿
     const bool constant_cam_from_world =
         !options_.refine_rig_from_world ||
         config_.HasConstantRigFromWorldPose(image.FrameId());
 
-    // Add residuals to bundle adjustment problem.
+    // ========== 为每个观测添加重投影误差残差项 ==========
     size_t num_observations = 0;
     for (const Point2D& point2D : image.Points2D()) {
+      // 跳过没有对应3D点的2D特征点
       if (!point2D.HasPoint3D()) {
         continue;
       }
 
+      // 统计有效观测数量
       num_observations += 1;
+      // 更新该3D点的观测计数
       point3D_num_observations_[point2D.point3D_id] += 1;
 
+      // 获取对应的3D点
       Point3D& point3D = reconstruction.Point3D(point2D.point3D_id);
+      // 检查：3D点的轨迹长度必须大于1（至少被两张图像观测到）
       THROW_CHECK_GT(point3D.track.Length(), 1);
 
       if (constant_cam_from_world) {
+        // 位姿固定情况：使用常量位姿的代价函数
+        // 只优化3D点坐标和相机内参
         problem_->AddResidualBlock(
             CreateCameraCostFunction<ReprojErrorConstantPoseCostFunctor>(
                 camera.model_id, point2D.xy, cam_from_world),
             loss_function_.get(),
-            point3D.xyz.data(),
-            camera.params.data());
+            point3D.xyz.data(),      // 3D点坐标（待优化）
+            camera.params.data());   // 相机内参（待优化/常量）
       } else {
+        // 位姿可变情况：同时优化位姿、3D点和内参
         problem_->AddResidualBlock(
             CreateCameraCostFunction<ReprojErrorCostFunctor>(camera.model_id,
                                                              point2D.xy),
             loss_function_.get(),
-            cam_from_world.rotation.coeffs().data(),
-            cam_from_world.translation.data(),
-            point3D.xyz.data(),
-            camera.params.data());
+            cam_from_world.rotation.coeffs().data(),   // 旋转四元数（待优化）
+            cam_from_world.translation.data(),         // 平移向量（待优化）
+            point3D.xyz.data(),                        // 3D点坐标（待优化）
+            camera.params.data());                     // 相机内参（待优化/常量）
       }
     }
 
+    // 如果该图像有有效观测，将其相机和图像ID加入已参数化集合
     if (num_observations > 0) {
       parameterized_camera_ids_.insert(image.CameraId());
       parameterized_image_ids_.insert(image.ImageId());
     }
   }
 
+  /**
+   * [功能描述]：添加具有非简单帧的图像到优化问题。
+   *            非简单帧表示相机是相机组（rig）的一部分，
+   *            涉及相机到rig的变换和rig到世界的变换两层变换。
+   * @param image：图像对象引用。
+   * @param reconstruction：三维重建数据引用。
+   */
   void AddImageWithNonTrivialFrame(Image& image,
                                    Reconstruction& reconstruction) {
+    // 获取相机和传感器ID
     Camera& camera = *image.CameraPtr();
     const sensor_t sensor_id = camera.SensorId();
 
+    // 断言检查：确保图像不是简单帧
     THROW_CHECK(!image.HasTrivialFrame());
+    // 获取相机到rig的变换（cam_from_rig = T_cr）
     Rigid3d& cam_from_rig =
         image.FramePtr()->RigPtr()->SensorFromRig(sensor_id);
+    // 获取rig到世界的变换（rig_from_world = T_rw）
     Rigid3d& rig_from_world = image.FramePtr()->RigFromWorld();
 
+    // 判断相机到rig的变换是否保持常量
     const bool constant_sensor_from_rig =
         !options_.refine_sensor_from_rig ||
         config_.HasConstantSensorFromRigPose(sensor_id);
+    // 判断rig到世界的变换是否保持常量
     const bool constant_rig_from_world =
         !options_.refine_rig_from_world ||
         config_.HasConstantRigFromWorldPose(image.FrameId());
 
-    // Add residuals to bundle adjustment problem.
+    // ========== 为每个观测添加重投影误差残差项 ==========
     size_t num_observations = 0;
     for (const Point2D& point2D : image.Points2D()) {
+      // 跳过没有对应3D点的2D特征点
       if (!point2D.HasPoint3D()) {
         continue;
       }
@@ -817,9 +1002,11 @@ class DefaultBundleAdjuster : public BundleAdjuster {
       Point3D& point3D = reconstruction.Point3D(point2D.point3D_id);
       THROW_CHECK_GT(point3D.track.Length(), 1);
 
-      // The !constant_sensor_from_rig && constant_rig_from_world is
-      // rare enough that we do not have a specialized cost function for it.
+      // 注意：!constant_sensor_from_rig && constant_rig_from_world 的情况
+      // 比较罕见，因此没有为其设计专门的代价函数
       if (constant_sensor_from_rig && constant_rig_from_world) {
+        // 情况1：相机到rig和rig到世界的变换都固定
+        // 预计算组合变换 T_cw = T_cr * T_rw
         problem_->AddResidualBlock(
             CreateCameraCostFunction<ReprojErrorConstantPoseCostFunctor>(
                 camera.model_id, point2D.xy, cam_from_rig * rig_from_world),
@@ -827,62 +1014,80 @@ class DefaultBundleAdjuster : public BundleAdjuster {
             point3D.xyz.data(),
             camera.params.data());
       } else if (!constant_rig_from_world && constant_sensor_from_rig) {
+        // 情况2：rig到世界可变，相机到rig固定
+        // 优化rig位姿，相机到rig变换作为常量传入
         problem_->AddResidualBlock(
             CreateCameraCostFunction<RigReprojErrorConstantRigCostFunctor>(
                 camera.model_id, point2D.xy, cam_from_rig),
             loss_function_.get(),
-            rig_from_world.rotation.coeffs().data(),
-            rig_from_world.translation.data(),
+            rig_from_world.rotation.coeffs().data(),   // rig旋转（待优化）
+            rig_from_world.translation.data(),         // rig平移（待优化）
             point3D.xyz.data(),
             camera.params.data());
       } else {
+        // 情况3：相机到rig和/或rig到世界都可变
+        // 同时优化两层变换
         problem_->AddResidualBlock(
             CreateCameraCostFunction<RigReprojErrorCostFunctor>(camera.model_id,
                                                                 point2D.xy),
             loss_function_.get(),
-            cam_from_rig.rotation.coeffs().data(),
-            cam_from_rig.translation.data(),
-            rig_from_world.rotation.coeffs().data(),
-            rig_from_world.translation.data(),
+            cam_from_rig.rotation.coeffs().data(),     // 相机到rig旋转（待优化）
+            cam_from_rig.translation.data(),           // 相机到rig平移（待优化）
+            rig_from_world.rotation.coeffs().data(),   // rig到世界旋转（待优化）
+            rig_from_world.translation.data(),         // rig到世界平移（待优化）
             point3D.xyz.data(),
             camera.params.data());
       }
     }
 
+    // 如果该图像有有效观测，将其相机和图像ID加入已参数化集合
     if (num_observations > 0) {
       parameterized_camera_ids_.insert(image.CameraId());
       parameterized_image_ids_.insert(image.ImageId());
     }
   }
 
+  /**
+   * [功能描述]：将指定的3D点添加到优化问题中。
+   *            为该3D点在所有观测图像中添加重投影误差约束（对于尚未添加的图像）。
+   *            这些额外图像的位姿被视为常量，不参与优化。
+   * @param point3D_id：要添加的3D点ID。
+   * @param reconstruction：三维重建数据引用。
+   */
   void AddPointToProblem(const point3D_t point3D_id,
                          Reconstruction& reconstruction) {
+    // 获取3D点引用
     Point3D& point3D = reconstruction.Point3D(point3D_id);
 
+    // 获取该3D点已添加的观测数量的引用
     size_t& num_observations = point3D_num_observations_[point3D_id];
 
-    // Is 3D point already fully contained in the problem? I.e. its entire
-    // track is contained in `variable_image_ids`, `constant_image_ids`,
-    // `constant_x_image_ids`.
+    // 检查3D点是否已完全包含在问题中
+    // 即其所有观测都已通过 variable_image_ids、constant_image_ids、
+    // constant_x_image_ids 添加
     if (num_observations == point3D.track.Length()) {
       return;
     }
 
+    // 遍历该3D点的所有观测轨迹元素
     for (const auto& track_el : point3D.track.Elements()) {
-      // Skip observations that were already added in `FillImages`.
+      // 跳过已在FillImages中添加过的观测
       if (config_.HasImage(track_el.image_id)) {
         continue;
       }
 
       num_observations += 1;
 
+      // 获取观测该点的图像、相机和2D点
       Image& image = reconstruction.Image(track_el.image_id);
       Camera& camera = *image.CameraPtr();
       const Point2D& point2D = image.Point2D(track_el.point2D_idx);
 
       if (image.HasTrivialFrame()) {
+        // 简单帧情况：直接使用相机到世界的变换
         Rigid3d& cam_from_world = image.FramePtr()->RigFromWorld();
 
+        // 添加常量位姿的重投影误差（这些图像的位姿不参与优化）
         problem_->AddResidualBlock(
             CreateCameraCostFunction<ReprojErrorConstantPoseCostFunctor>(
                 camera.model_id, point2D.xy, cam_from_world),
@@ -890,10 +1095,12 @@ class DefaultBundleAdjuster : public BundleAdjuster {
             point3D.xyz.data(),
             camera.params.data());
       } else {
+        // 非简单帧情况：需要组合相机到rig和rig到世界的变换
         Rigid3d& cam_from_rig = image.FramePtr()->RigPtr()->SensorFromRig(
             image.CameraPtr()->SensorId());
         Rigid3d& rig_from_world = image.FramePtr()->RigFromWorld();
 
+        // 使用组合变换 T_cw = T_cr * T_rw 作为常量
         problem_->AddResidualBlock(
             CreateCameraCostFunction<ReprojErrorConstantPoseCostFunctor>(
                 camera.model_id, point2D.xy, cam_from_rig * rig_from_world),
@@ -902,8 +1109,8 @@ class DefaultBundleAdjuster : public BundleAdjuster {
             camera.params.data());
       }
 
-      // Do not optimize intrinsics if th corresponding images
-      // were not included explicitly in the config.
+      // 如果该相机是新添加的，将其内参设置为常量
+      // 原因：对应图像未显式包含在配置中，不应优化其内参
       if (parameterized_camera_ids_.insert(image.CameraId()).second) {
         config_.SetConstantCamIntrinsics(image.CameraId());
       }
@@ -911,11 +1118,16 @@ class DefaultBundleAdjuster : public BundleAdjuster {
   }
 
  private:
+  // Ceres优化问题对象，存储所有残差项和参数块
   std::shared_ptr<ceres::Problem> problem_;
+  // 鲁棒损失函数，用于减少外点对优化的影响
   std::unique_ptr<ceres::LossFunction> loss_function_;
 
+  // 已添加到问题中的相机ID集合，用于跟踪哪些相机已被参数化
   std::set<camera_t> parameterized_camera_ids_;
+  // 已添加到问题中的图像ID集合，用于跟踪哪些图像已被参数化
   std::set<image_t> parameterized_image_ids_;
+  // 3D点ID到其观测数量的映射，用于跟踪每个3D点被添加了多少观测
   std::unordered_map<point3D_t, size_t> point3D_num_observations_;
 };
 
